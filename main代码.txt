@@ -1,0 +1,445 @@
+#include "stm32f10x.h"
+#include <string.h>
+#include <stdio.h>
+
+#include "led.h"
+#include "delay.h"
+#include "key.h"
+#include "ld.h"
+#include "sys.h"
+#include "oled.h"
+#include "bmp.h"
+#include "usart1.h"
+#include "usart2.h"
+#include "usart3.h"
+#include "soft_uart.h"
+#include "stepmotor.h"
+#include "control.h"
+
+/* 串口文本协议：配网时先发 wifi:账号，再发 password:密码（可带换行结束） */
+#define WIFI_ACCOUNT_PREFIX   "wifi:"
+#define WIFI_PASSWORD_PREFIX  "password:"
+#define WIFI_SENSOR_PREFIX 	"SNSOR:"
+#define WIFI_ESP 	"ESP:"
+#define MAX_BUFFER_SIZE       128
+#define MAX_ACCOUNT_LEN       32
+#define MAX_PASSWORD_LEN      64
+#define MAX_DATA_LEN          128
+
+/*
+ * 传感器数据（USART1 正式采集 / USART3 调试均可，每行一条，\r 或 \n 结束）：
+ *   温度×10 , 湿度×10 , 光照(整数)
+ * 例：253,652,1850  -> 25.3℃ , 65.2% , 光照 1850
+ * （用整数避免 Keil MicroLib 下 scanf 不支持 %f）
+ */
+#define SENSOR_LINE_MAX       96
+
+/* USART1 单字符指令（当前主循环未使用，保留供扩展） */
+typedef enum {
+    CMD_UNKNOWN,
+    CMD_LED_CTRL_OFF,
+    CMD_LED_CTRL_ON,
+    CMD_BEEP_CTRL,
+    CMD_GET_DATA,
+    CMD_SPECIAL
+} UART_Command;
+
+/* USART2 配网/透传状态机 */
+typedef enum {
+    WAITING_FOR_ACCOUNT,
+    WAITING_FOR_PASSWORD,
+    READY_TO_SEND,
+    RECEIVING_ACCOUNT,
+    RECEIVING_PASSWORD,
+    RECEIVING_DATA
+} State;
+
+static State current_state = WAITING_FOR_ACCOUNT;
+static char received_account[MAX_ACCOUNT_LEN] = {0};
+static char received_password[MAX_PASSWORD_LEN] = {0};
+static char received_data[MAX_DATA_LEN] = {0};
+static char re[SENSOR_LINE_MAX] = {0};
+static char received3_data[MAX_DATA_LEN] = {0};
+static uint8_t ac = 0;
+static uint8_t account_index = 0;
+static uint8_t password_index = 0;
+static uint8_t usart2_data_index = 0;
+static uint8_t received3_index = 0;
+static uint8_t usart2_prefix_match_index = 0;
+static uint8_t prefix_match_index = 0;
+static uint8_t motor_state = 1;
+static uint8_t prefix_ESP_index = 0;
+
+static char usart1_sensor_line[SENSOR_LINE_MAX];
+static char usart1_ESP_line[SENSOR_LINE_MAX];
+static uint8_t usart1_sensor_idx = 0;
+static uint8_t usart1_in_sensor_data = 0;
+static uint8_t usart1_esp_idx = 0;
+static uint8_t usart1_in_esp_data = 0;
+/* 温度、湿度：数值 = 实际值 ×10（253 表示 25.3） */
+static void sensor_fmt_temp(char *buf, int v10)
+{
+    if (v10 < 0) {
+        v10 = -v10;
+        sprintf(buf, ":-%d", v10 / 10);
+    } else {
+        sprintf(buf, ":%d", v10 / 10);
+    }
+}
+
+static void sensor_fmt_hum(char *buf, int v10)
+{
+    if (v10 < 0) {
+        v10 = -v10;
+        sprintf(buf, ":-%d", v10 / 10);
+    } else {
+        sprintf(buf, ":%d", v10 / 10);
+    }
+}
+
+/* 解析一行传感器文本并刷新 OLED 顶部三行。成功返回 1，格式不对返回 0 */
+static int try_sensor_update_oled(const char *line)
+{
+    int t10, h10;
+    unsigned int light = 0;
+    char line1[24], line2[24], line3[24];
+
+    if (sscanf(line, "%d,%d,%u", &t10, &h10, &light) != 3) {
+        return 0;
+    }
+    sensor_fmt_temp(line1, t10);
+    sensor_fmt_hum(line2, h10);
+    sprintf(line3, ":%u", light);
+//    USART2_SendString(line3);
+    
+    OLED_Clear_Area(0,0,127,15);
+	OLED_Clear_Area(0,16,71,31);
+    OLED_Show_Chinese_String(0, 0, "温度");
+    OLED_Show_String(32, 0, line1);
+    OLED_Show_Chinese_String(56, 0, "湿度");
+    OLED_Show_String(88, 0, line2);
+    OLED_Show_Chinese_String(0, 16, "光照");
+    OLED_Show_String(32, 16, line3);
+	
+    OLED_Refresh_Gram();
+    
+    // 更新传感器数据到控制模块
+    Control_UpdateSensorData(t10, h10, light);
+    
+    return 1;
+}
+
+UART_Command Parse_UART_Cmd(uint8_t data)
+{
+    switch (data) {
+        case '0': return CMD_LED_CTRL_OFF;
+        case '1': return CMD_LED_CTRL_ON;
+        case '3': return CMD_BEEP_CTRL;
+        case '4': return CMD_GET_DATA;
+        case '9': return CMD_SPECIAL;
+        default:  return CMD_UNKNOWN;
+    }
+}
+
+uint32_t g_led_blink_time = 0;
+uint8_t  g_led_blink_state = 0;
+
+
+// 函数声明
+static void process_usart3_char(char c);
+static void handle_usart3_line(void);
+static uint8_t is_motor_command(const char *cmd);
+static void handle_motor_command_with_status(const char *cmd);
+static void display_usart3_command(const char *cmd);
+static void test_motor(void);
+static void update_motor_test(void);
+
+
+
+
+// 在OLED上显示USART3接收到的命令
+static void display_usart3_command(const char *cmd)
+{
+    OLED_Clear_Gram();
+    OLED_Show_String(0, 0, cmd);
+    OLED_Refresh_Gram();
+}
+
+int main(void)
+{
+    
+    Systick_Init(9000);
+
+    key_Config();
+    USART1_Init();
+    USART2_Init();
+    USART3_Init();
+    led_Config();
+    LEDA_OFF(5|4);
+	
+    LEDC_OFF(13);
+	LEDB_ON(13);
+    OLED_Init();
+    OLED_Clear_Gram();
+    OLED_Refresh_Gram();
+
+    
+    // 初始化电机控制
+    MOTOR_Init();
+    // 初始化控制模块
+    Control_Init();
+    BEEP_OFF();
+    OLED_Show_Chinese_String(0,32,"风扇");
+    OLED_Show_String(32, 32, ":");
+    OLED_Show_Chinese_String(40, 32, "关闭");
+    OLED_Show_Chinese_String(0,48,"窗帘");
+    OLED_Show_String(32, 48, ":");
+    OLED_Show_Chinese_String(40, 48, "打开");
+	OLED_Show_Chinese_String(88, 48, "灯关");
+	OLED_Show_Chinese_String(88, 16, "未连");
+	OLED_Refresh_Gram();
+    while (1) {
+	 /* PC13 指示灯约 500ms 翻转一次（非阻塞） */
+        if (SystemTick_Get() - g_led_blink_time >= 500) {
+            g_led_blink_time = SystemTick_Get();
+            if (g_led_blink_state) {
+                LEDC_OFF(13);
+                g_led_blink_state = 0;
+            } else {
+                LEDC_ON(13);
+                g_led_blink_state = 1;
+            }
+        }
+        
+        /* 按键控制风扇开关和电机测试 */
+        if (KEY_Vakue() == 1) {
+            // 切换风扇状态
+            Control_SetFan(!control_state.fan_on);
+            // 显示风扇状态
+            OLED_Clear_Area(40, 32, 127, 47);
+            if (control_state.fan_on) {
+				OLED_Show_Chinese_String(40, 32, "打开");
+				USART1_SendString("FANON.");
+						USART1_SendString("\n");
+            } else {
+               OLED_Show_Chinese_String(40, 32, "关闭");
+				USART1_SendString("FANOFF.");
+						USART1_SendString("\n");
+            }
+            OLED_Refresh_Partial(40, 32, 127, 47);
+            
+        }
+		/* 按键控制电机开关 */
+        if (KEY2_Vakue() == 1) {
+            // 切换电机状态
+            
+            // 显示电机状态
+            OLED_Clear_Area(40, 48, 127, 63);
+            if (motor_state) {
+                OLED_Show_Chinese_String(40, 48, "关闭中");
+                OLED_Refresh_Partial(40, 48, 127, 63);
+                Control_SetLight(1);
+                Control_SetCurtain(!control_state.curtain_open);
+				USART1_SendString("MOTORON.");
+						USART1_SendString("\n");
+				 OLED_Clear_Area(40, 48, 127, 63);
+				OLED_Show_Chinese_String(40, 48, "关闭");
+               OLED_Refresh_Partial(40, 48, 127, 63);
+                motor_state = 0;
+            } else {
+                OLED_Show_Chinese_String(40, 48, "打开中");
+                OLED_Refresh_Partial(40, 48, 127, 63);
+                Control_SetCurtain(!control_state.curtain_open);
+                USART1_SendString("MOTOROFF.");
+				USART1_SendString("\n");
+				 OLED_Clear_Area(40, 48, 127, 63);
+				OLED_Show_Chinese_String(40, 48, "打开");
+               OLED_Refresh_Partial(40, 48, 127, 63);
+                Control_SetLight(0);
+				motor_state = 1;
+            }
+           
+            
+        }
+        /* USART1：温湿度、光照（SENSOR:前缀）、ESP控制指令（ESP:前缀.结尾）、电机控制 */
+        if (USART1_DataAvailable()) {
+            static uint8_t processing = 0;
+            if (processing) continue;
+            processing = 1;
+
+            while (USART1_DataAvailable()) {
+                char c = USART1_ReadByte();
+//				USART2_SendByte(c);
+                if (usart1_in_esp_data) {
+                    if (c == '.') {
+                        usart1_ESP_line[usart1_esp_idx] = '\0';
+                        usart1_in_esp_data = 0;
+                        usart1_esp_idx = 0;
+
+                        if (strlen(usart1_ESP_line) > 0) {
+//                            USART1_SendString("ESP:");
+//                            USART1_SendString(usart1_ESP_line);
+//                            USART1_SendString("\n");
+                            Control_ProcessCommand(usart1_ESP_line);
+                            USART2_SendString(usart1_ESP_line);
+                            USART2_SendString("\n");
+                        }
+                    } else {
+                        if (usart1_esp_idx < (SENSOR_LINE_MAX - 1)) {
+                            usart1_ESP_line[usart1_esp_idx++] = c;
+                        }
+                    }
+                } else if (usart1_in_sensor_data) {
+//					USART2_SendString("Data Available\r\n");
+                    if (c == '\r' || c == '\n') {
+                        usart1_sensor_line[usart1_sensor_idx] = '\0';
+                        usart1_in_sensor_data = 0;
+                        usart1_sensor_idx = 0;
+
+                        int t10, h10;
+                        unsigned int light;
+//						 USART2_SendString("22222");
+                        if (sscanf(usart1_sensor_line, "%d,%d,%u", &t10, &h10, &light) == 3) {
+                            char response[64];
+                            sprintf(response, "%d,%d,%u\n", t10, h10, light/100);
+//                            USART2_SendString(response);
+                            Control_UpdateSensorData(t10, h10, light/100);
+                            try_sensor_update_oled(usart1_sensor_line);
+                        }
+                    } else {
+                        if (usart1_sensor_idx < (SENSOR_LINE_MAX - 1)) {
+                            usart1_sensor_line[usart1_sensor_idx++] = c;
+                        }
+                    }
+                } else if (c == WIFI_ESP[prefix_ESP_index]) {
+                    prefix_ESP_index++;
+                    if (prefix_ESP_index >= strlen(WIFI_ESP)) {
+                        usart1_in_esp_data = 1;
+                        usart1_esp_idx = 0;
+                        prefix_ESP_index = 0;
+                    }
+                } else if (c == WIFI_SENSOR_PREFIX[prefix_match_index]) {
+                    prefix_match_index++;
+                    if (prefix_match_index >= strlen(WIFI_SENSOR_PREFIX)) {
+                        usart1_in_sensor_data = 1;
+                        usart1_sensor_idx = 0;
+                        prefix_match_index = 0;
+                    }
+           }  
+
+else {
+                    if (usart1_sensor_idx < (SENSOR_LINE_MAX - 1)) {
+                        usart1_sensor_line[usart1_sensor_idx++] = c;
+                    }
+                    prefix_match_index = 0;
+                    prefix_ESP_index = 0;
+                }
+            }
+
+            processing = 0;
+        }
+
+        /* USART2：蓝牙/模块侧。匹配 wifi:/password: 则走配网；否则按行缓存透传 */
+        if (USART2_DataAvailable()) {
+            char c = USART2_ReadByte();
+
+            switch (current_state) {
+            case WAITING_FOR_ACCOUNT:
+                if (c == WIFI_ACCOUNT_PREFIX[usart2_prefix_match_index]) {
+                    usart2_prefix_match_index++;
+                    if (usart2_prefix_match_index >= strlen(WIFI_ACCOUNT_PREFIX)) {
+                        current_state = RECEIVING_ACCOUNT;
+                        usart2_prefix_match_index = 0;
+                        account_index = 0;
+                    }
+                } else {
+                    usart2_prefix_match_index = 0;
+                    current_state = RECEIVING_DATA;
+                    usart2_data_index = 0;
+                    if (usart2_data_index < MAX_DATA_LEN - 1) {
+                        received_data[usart2_data_index++] = c;
+                    }
+                }
+                break;
+                
+            case RECEIVING_DATA:
+                if (c == '.' || usart2_data_index >= MAX_DATA_LEN - 1) {
+                    received_data[usart2_data_index] = '\0';
+                    usart2_data_index = 0;
+
+                    if (strlen(received_data) > 0) {
+                        Control_ProcessCommand(received_data);
+                        USART1_SendString(received_data);
+						USART1_SendString("\n");
+                    }
+
+                    current_state = WAITING_FOR_ACCOUNT;
+                } else if (usart2_data_index < MAX_DATA_LEN - 1) {
+                    received_data[usart2_data_index++] = c;
+                }
+                break;
+
+            case RECEIVING_ACCOUNT:
+                if (c == '\r' || c == '\n' || account_index >= MAX_ACCOUNT_LEN - 1) {
+                    received_account[account_index] = '\0';
+                    current_state = WAITING_FOR_PASSWORD;
+                } else {
+                    received_account[account_index++] = c;
+                }
+                break;
+
+            case WAITING_FOR_PASSWORD:
+                if (c == WIFI_PASSWORD_PREFIX[usart2_prefix_match_index]) {
+                    usart2_prefix_match_index++;
+                    if (usart2_prefix_match_index >= strlen(WIFI_PASSWORD_PREFIX)) {
+                        current_state = RECEIVING_PASSWORD;
+                        usart2_prefix_match_index = 0;
+                        password_index = 0;
+                    }
+                } else {
+                    usart2_prefix_match_index = 0;
+                }
+                break;
+
+            case RECEIVING_PASSWORD:
+                if (c == '\r' || c == '\n' || password_index >= MAX_PASSWORD_LEN - 1) {
+                    received_password[password_index] = '\0';
+                    current_state = WAITING_FOR_ACCOUNT;
+                    USART1_SendString("WIFI:");
+                    USART1_SendString(received_account);
+                    USART1_SendString(",");
+                    USART1_SendString(received_password);
+                    USART1_SendString("\n");
+                } else {
+                    received_password[password_index++] = c;
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+
+
+
+        if (USART3_DataAvailable()) {
+            char c = USART3_ReadByte();
+            if (c == '.' || received3_index >= MAX_DATA_LEN - 1) {
+                received3_data[received3_index] = '\0';
+                received3_index = 0;
+                if (strlen(received3_data) > 0) {
+                    Control_ProcessCommand(received3_data);
+                    USART1_SendString(received3_data);
+                    USART1_SendString("\n");
+                }
+            } else {
+                received3_data[received3_index++] = c;
+            }
+        }
+	
+
+       Control_Update();
+
+}
+
+}
